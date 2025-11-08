@@ -7,6 +7,8 @@ import seaborn as sns
 import nltk
 from nltk.corpus import stopwords
 import csv
+import json
+import numpy as np
 
 # ====================================================
 # DETECCIÓN AUTOMÁTICA DE GPU
@@ -48,6 +50,7 @@ else:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import LabelEncoder
+    from sklearn.model_selection import GridSearchCV
 
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from sklearn.utils import shuffle
@@ -58,6 +61,7 @@ from sklearn.utils import shuffle
 df = pd.read_csv(DATASET_PATH, low_memory=False)
 df["text"] = df["text"].astype(str).str.strip()
 df["label"] = df["label"].astype(str).str.strip()
+df = df[df["text"].str.split().str.len() >= 4]  # eliminar textos muy cortos
 df = df.dropna(subset=["text", "label"])
 df = shuffle(df, random_state=42)
 
@@ -82,7 +86,15 @@ print(f"Train: {len(train_df)} | Validation: {len(val_df)}")
 # VECTORIZACIÓN TF-IDF
 # ====================================================
 print("🧠 Vectorizando texto (TF-IDF)...")
-tfidf = TfidfVectorizer(max_features=25000, ngram_range=(1, 2), stop_words=spanish_stopwords)
+tfidf = TfidfVectorizer(
+    max_features=120000,
+    ngram_range=(1, 3),
+    stop_words=spanish_stopwords,
+    sublinear_tf=True,
+    min_df=2,          # elimina términos raros
+    max_df=0.9,        # elimina términos demasiado comunes
+    norm='l2'
+)
 
 if USE_GPU:
     X_train = tfidf.fit_transform(cudf.Series(train_df["text"]))
@@ -98,20 +110,29 @@ print(f"✅ Vectorización completa. Dimensiones: {X_train.shape}")
 # ====================================================
 print("🚀 Entrenando modelo...")
 if USE_GPU:
-    lr = LogisticRegression(max_iter=400, fit_intercept=True, class_weight="balanced")
+    lr = LogisticRegression(max_iter=500, fit_intercept=True, class_weight="balanced")
     le = LabelEncoder()
     y_train = le.fit_transform(cudf.Series(train_df["label"]))
     y_val = le.transform(cudf.Series(val_df["label"]))
 else:
-    lr = LogisticRegression(max_iter=400, solver="lbfgs", class_weight="balanced", n_jobs=-1)
     le = LabelEncoder()
     y_train = le.fit_transform(train_df["label"])
     y_val = le.transform(val_df["label"])
 
+    # 🔍 Pequeño grid search para optimizar regularización
+    grid_params = {"C": [0.5, 1.0, 2.0], "penalty": ["l2"]}
+    base_lr = LogisticRegression(max_iter=500, solver="lbfgs", class_weight="balanced", n_jobs=-1)
+    search = GridSearchCV(base_lr, grid_params, cv=2, n_jobs=-1, verbose=1)
+    search.fit(X_train, y_train)
+    lr = search.best_estimator_
+    print(f"🏆 Mejor parámetro C encontrado: {lr.C}")
+
 for _ in tqdm(range(5), desc="⚙️ Inicializando entrenamiento"):
     pass
 
-lr.fit(X_train, y_train)
+if USE_GPU:
+    lr.fit(X_train, y_train)
+
 print("✅ Entrenamiento completado.")
 
 # ====================================================
@@ -126,36 +147,57 @@ else:
     preds = le.inverse_transform(preds_enc)
 
 acc = accuracy_score(val_df["label"], preds)
+report = classification_report(val_df["label"], preds, zero_division=0, output_dict=True)
+
 print(f"\n🎯 Accuracy general: {acc:.3f}\n")
 print("📈 Reporte detallado:")
 print(classification_report(val_df["label"], preds, zero_division=0))
 
 # ====================================================
-# MATRIZ DE CONFUSIÓN (guardada en archivo)
+# GUARDAR MÉTRICAS Y TOP LABELS
+# ====================================================
+metrics_path = os.path.join(OUTPUT_DIR, "metrics.json")
+with open(metrics_path, "w", encoding="utf-8") as f:
+    json.dump({
+        "accuracy": acc,
+        "macro_avg": report["macro avg"],
+        "weighted_avg": report["weighted avg"]
+    }, f, indent=4, ensure_ascii=False)
+print(f"📊 Métricas guardadas en: {metrics_path}")
+
+# top 20 etiquetas más frecuentes
+top_labels = df["label"].value_counts().head(20).index
+top_report = {k: v for k, v in report.items() if k in top_labels}
+pd.DataFrame(top_report).T.to_csv(
+    os.path.join(OUTPUT_DIR, "top_labels_metrics.csv"),
+    quoting=csv.QUOTE_ALL,
+    encoding="utf-8-sig"
+)
+
+# ====================================================
+# MATRIZ DE CONFUSIÓN (conversión segura)
 # ====================================================
 print("📉 Generando matriz de confusión...")
 
-if USE_GPU:
-    # Convertir desde GPU (cupy/cudf) a NumPy
-    if hasattr(y_val, "to_numpy"):
-        y_true_np = y_val.to_numpy()
-    elif hasattr(y_val, "get"):
-        y_true_np = y_val.get()
-    else:
-        y_true_np = y_val
+def to_numpy_safe(arr):
+    """Convierte cuDF/cuPy/NumPy a NumPy puro de forma segura."""
+    try:
+        if hasattr(arr, "to_numpy"):
+            return arr.to_numpy()
+        elif hasattr(arr, "get"):
+            return arr.get()
+        elif isinstance(arr, np.ndarray):
+            return arr
+        else:
+            return np.array(arr)
+    except Exception as e:
+        print(f"⚠️ Conversión a NumPy falló: {e}")
+        return np.array(arr)
 
-    if hasattr(preds_enc, "to_numpy"):
-        y_pred_np = preds_enc.to_numpy()
-    elif hasattr(preds_enc, "get"):
-        y_pred_np = preds_enc.get()
-    else:
-        y_pred_np = preds_enc
-else:
-    y_true_np = y_val
-    y_pred_np = preds_enc
+y_true_np = to_numpy_safe(y_val)
+y_pred_np = to_numpy_safe(preds_enc)
 
 cm = confusion_matrix(y_true_np, y_pred_np)
-
 plt.figure(figsize=(10, 8))
 sns.heatmap(cm, cmap="Blues", xticklabels=False, yticklabels=False)
 plt.title("Matriz de confusión (simplificada)")
@@ -207,7 +249,7 @@ out_csv = os.path.join(OUTPUT_DIR, "validation_predictions.csv")
 val_df.to_csv(
     out_csv,
     index=False,
-    quoting=csv.QUOTE_ALL,  # asegura comillas en todo
+    quoting=csv.QUOTE_ALL,
     quotechar='"',
     encoding="utf-8-sig"
 )
