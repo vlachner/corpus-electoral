@@ -4,80 +4,99 @@ from tqdm import tqdm
 import csv
 
 # ================================================
-# CONFIGURACIÓN
+# CONFIGURATION
 # ================================================
-BASE_DIR = "manifestoProjectDocs"
+BASE_DIR = "manifestoProjectDocs"  
+# Root directory where all manifesto CSV files are stored.
+
 CODEBOOK_PATH = os.path.join(BASE_DIR, "codebook_categories_MPDS2020a.csv")
+# MARPOR codebook containing mapping from cmp_code → title/category.
+
 COUNTRIES_PATH = os.path.join(BASE_DIR, "MPDataset_MPDS2025a.csv")
+# Dataset containing country codes, country names, party codes, and party names.
+
 OUTPUT_DATASET = "training_dataset_manifesto.csv"
+# Final output dataset used for ML training (text + label).
 
 # ================================================
-# CARGAR CODEBOOK Y MAPA DE PARTIDOS/PAÍSES
+# LOAD CODEBOOK AND COUNTRY/PARTY MAPPINGS
 # ================================================
 df_codebook = pd.read_csv(CODEBOOK_PATH)
+# Normalize codebook codes (remove trailing ".0" from float-to-string conversion).
 df_codebook["code"] = df_codebook["code"].astype(str).str.replace(".0", "", regex=False)
 
 df_countries = pd.read_csv(COUNTRIES_PATH, low_memory=False)
 
-# Limpieza básica
+# Basic cleanup to ensure consistent formatting of identifiers.
 df_countries["country"] = df_countries["country"].astype(str).str.strip()
 df_countries["party"] = df_countries["party"].astype(str).str.strip()
 df_countries["countryname"] = df_countries["countryname"].astype(str).str.strip()
 df_countries["partyname"] = df_countries["partyname"].astype(str).str.strip()
 
+# Maps for retrieving country and party names from their codes.
 country_map = dict(zip(df_countries["country"], df_countries["countryname"]))
 party_map = dict(zip(df_countries["party"], df_countries["partyname"]))
 
 # ================================================
-# RECOLECCIÓN GLOBAL DE MANIFIESTOS
+# GLOBAL COLLECTION OF MANIFESTO LINES
 # ================================================
-rows = []
+rows = []  # Will store extracted (text, label, metadata) rows from all manifestos.
 
+# Walk recursively through manifestoProjectDocs directory.
 for root, _, files in os.walk(BASE_DIR):
     for file in files:
         if not file.endswith(".csv"):
-            continue
+            continue  # Skip non-CSV files.
 
-        # Ignorar archivos de referencia
+        # Ignore reference metadata CSV files.
         if any(ex in file for ex in ["codebook", "MPDataset_MPDS2025a", "ListOfCountriesInfo"]):
             continue
 
         file_path = os.path.join(root, file)
+
         try:
             df = pd.read_csv(file_path)
 
+            # If there is no code column, the file is not a manifesto.
             if "cmp_code" not in df.columns:
                 continue
 
-            # Convertir códigos a texto
+            # Normalize cmp_code format.
             df["cmp_code"] = df["cmp_code"].astype(str).str.replace(".0", "", regex=False)
 
-            # Merge con el codebook
+            # Merge manifesto data with codebook to attach category titles.
             merged = df.merge(df_codebook, how="left", left_on="cmp_code", right_on="code")
 
             # -----------------------------------------------
-            # 🔍 Identificar país y partido desde el filename
+            # 🔍 IDENTIFY COUNTRY AND PARTY FROM FILENAME
             # -----------------------------------------------
-            file_id = file.split("_")[0]
+            file_id = file.split("_")[0]  
+            # Example filename: "35210_PartyName_2019.csv"
+            # The prefix "35210" contains both the country code and the party code.
 
-            # Buscar coincidencia de país (2 o 3 dígitos)
+            # Try matching the longest possible country code first.
             country_candidates = sorted(df_countries["country"].unique(), key=len, reverse=True)
             country_code = None
+
             for candidate in country_candidates:
                 if file_id.startswith(candidate):
                     country_code = candidate
                     break
 
+            # Resolve country name (fallback to Unknown)
             country_name = country_map.get(country_code, "Unknown Country") if country_code else "Unknown Country"
 
-            # ⚠️ El party_code es el código completo (country + party)
+            # Party code is the full prefix (country + party)
             party_code = file_id
             party_row = df_countries.loc[df_countries["party"] == party_code, "partyname"]
+            # If party not found in country dataset → label as Unknown
             party_name = party_row.values[0] if not party_row.empty else "Unknown"
+
+            # Extract year from filename (after the last "_")
             year = file.split("_")[-1].replace(".csv", "")
 
             # -----------------------------------------------
-            # 📜 Buscar la columna de texto
+            # 📜 DETECT TEXT COLUMN
             # -----------------------------------------------
             text_col = None
             for c in ["text", "sentence", "content", "quasi_sentence"]:
@@ -85,16 +104,17 @@ for root, _, files in os.walk(BASE_DIR):
                     text_col = c
                     break
 
+            # If no text column exists, skip this file
             if text_col is None:
                 continue
 
-            # Filtrar solo texto y etiqueta
+            # Extract text + category (title)
             subset = merged[[text_col, "title"]].copy()
 
-            # Reemplazar NaN o vacíos por "No category"
+            # Replace missing titles with a fallback label
             subset["title"] = subset["title"].fillna("No category")
 
-            # Limpiar texto
+            # Clean text: collapse whitespace and remove leading/trailing spaces
             subset[text_col] = (
                 subset[text_col]
                 .astype(str)
@@ -102,36 +122,40 @@ for root, _, files in os.walk(BASE_DIR):
                 .str.strip()
             )
 
+            # Attach metadata fields
             subset["country"] = country_name
             subset["party"] = party_name
             subset["year"] = year
-            subset["source_file"] = os.path.splitext(file)[0]
+            subset["source_file"] = os.path.splitext(file)[0]  # file without extension
 
-            # Debug opcional
+            # Optional debug info
             total = len(subset)
             no_cat = (subset["title"] == "No category").sum()
-            print(f"📄 {file}: {total} filas ({no_cat} sin categoría)")
+            print(f"📄 {file}: {total} rows ({no_cat} without category)")
 
             rows.append(subset)
 
         except Exception as e:
-            print(f"⚠️ Error leyendo {file_path}: {e}")
+            print(f"⚠️ Error reading {file_path}: {e}")
 
 # ================================================
-# CONCATENAR TODO Y GUARDAR
+# CONCATENATE EVERYTHING AND SAVE FINAL DATASET
 # ================================================
 if rows:
     df_all = pd.concat(rows, ignore_index=True)
+
+    # Rename columns so the ML pipeline always receives consistent names
     df_all.rename(columns={text_col: "text", "title": "label"}, inplace=True)
 
+    # Save dataset in CSV with full quoting (protects commas/newlines)
     df_all.to_csv(
         OUTPUT_DATASET,
         index=False,
-        quoting=csv.QUOTE_ALL,  # asegura comillas en todo
+        quoting=csv.QUOTE_ALL,
         quotechar='"',
         encoding="utf-8-sig"
     )
 
-    print(f"\n✅ Dataset generado con {len(df_all)} ejemplos -> {OUTPUT_DATASET}")
+    print(f"\n✅ Dataset generated with {len(df_all)} examples -> {OUTPUT_DATASET}")
 else:
-    print("⚠️ No se generaron filas. Revisa los nombres de columnas en tus CSVs.")
+    print("⚠️ No rows were generated. Check column names inside your manifesto CSV files.")
